@@ -7,7 +7,8 @@
   "idf.portWin": "COM4",
   "files.associations": {
     "spi_master.h": "c",
-    "format": "c"
+    "format": "c",
+    "stdio.h": "c"
   },
   "idf.flashType": "UART"
 }

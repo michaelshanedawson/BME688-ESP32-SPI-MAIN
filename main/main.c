@@ -8,7 +8,7 @@
 * Datasheet can be found here : https://www.bosch-sensortec.com/products/environmental-sensors/gas-sensors/bme688/#documents
 *
 * see README for changelog
-* v0.3
+* v0.5
 */
 
 #include <stdio.h>
@@ -32,6 +32,8 @@
 //BME688 Configuration Variables
 #define HEATER_TARGET_TEMP 300.00 //Target temperature for the gas sensor heater, usually between 200°C and 400°C. Floating point value.
 #define AMBIENT_TEMP 22.0 //General ambient room temperature, used to set the heater resistance. 
+#define TEMP_OFFSET 0.0 //Calibration temperature offset. Floating point value.
+#define PRESSURE_OFFSET 0.0 //Calibration pressure offset. Floating point value.
 
 /*Global variables*/
 uint8_t registerData = 0x00; //Variable to hold register data read results
@@ -46,19 +48,19 @@ void spi_write(spi_device_handle_t spi, uint8_t reg, uint8_t data, uint8_t page)
 void take_reading(spi_device_handle_t spi);
 double get_temperature();
 
-/*Temperature sensor calibration data*/
+/*Temperature sensor calibration data. This data will be used to perform the math on the polled ADC data during each read.*/
 double parT1 = 0x00; //Two bytes at LSB 0xE9 and MSB 0xEA, page 0
 double parT2 = 0x00; //Two bytes at LSB 0x8A and MSB 0x8B, page 0
 double parT3 = 0x00; //Single byte at 0x8C, page 0
 
-/*Gas sensor calibration data*/
+/*Gas sensor calibration data. This data will be used to perform the math on the polled ADC data during each read.*/
 double parG1 = 0x00; //Single byte at 0xED, page 0
 double parG2 = 0x00; //Two bytes at LSB 0xEB and MSB 0xEC, page 0
 double parG3 = 0x00; //Single byte at 0xEE, page 0
 int resHeatValue = 0x00; //Single signed value at 0x00, page 0
 uint8_t resHeatRange = 0x00; //Heater range at 0x02 <5:4>, page 0
 
-/*Pressure sensor calibration data*/
+/*Pressure sensor calibration data. This data will be used to perform the math on the polled ADC data during each read.*/
 double parP1 = 0x00; //Two bytes at LSB 0x8E and MSB 0x8F, page 0
 double parP2 = 0x00; //Two bytes at LSB 0x90 and MSB 0x91, page 0
 double parP3 = 0x00; //Single byte at 0x92, page 0
@@ -70,7 +72,7 @@ double parP8 = 0x00; //Two bytes at LSB 0x9C and MSB 0x9D, page 0
 double parP9 = 0x00; //Two bytes at LSB 0x9E and MSB 0x9F, page 0
 double parP10 = 0x00; //Single byte at 0xA0, page 0
 
-/*Humidity sensor calibration data*/
+/*Humidity sensor calibration data. This data will be used to perform the math on the polled ADC data during each read.*/
 double parH1 = 0x00; //Two bytes at LSB 0xE2<3:0> and MSB 0xE3, page 0
 double parH2 = 0x00; //Two bytes at LSB 0xE2<7:4> and MSB 0xE1, page 0
 double parH3 = 0x00; //Single byte at 0xE4, page 0
@@ -155,6 +157,11 @@ uint8_t spi_read(spi_device_handle_t spi, uint8_t reg, uint8_t page)
     return *(int*)t.rx_data; //Performs the return of the requested register data
 }
 
+/*
+* This function will handle writing data to the appropriate register.
+* The first step is to inform the device which register we wish to write to.
+* The second step is to send the data to the proper register.
+*/
 void spi_write(spi_device_handle_t spi, uint8_t reg, uint8_t data, uint8_t page)
 {
     /*This tells the BME 688 which memory page we want to write to*/
@@ -189,11 +196,16 @@ void spi_write(spi_device_handle_t spi, uint8_t reg, uint8_t data, uint8_t page)
             
 }
 
+/*
+* This function takes the reading and performs the calculations on the raw ADC data using the calibration data gathered earlier.
+* All calculations are for a floating point value. The datasheet shows the calculations to get an integer value for each reading as well.
+* This reading uses the forced mode of operation for the device, allowing the codebase to control when the readings take place.
+*/
 void take_reading(spi_device_handle_t spi)
 {
-    uint8_t operationByte = spi_read(spi, 0x74, 1); //Gets the current defined register
+    uint8_t operationByte = spi_read(spi, 0x74, 1); //Gets the current byte data for the Ctrl_meas register.
     operationByte = operationByte | 1 << 0; //Sets the mode bit to take a reading. We don't want to change anything else.
-    spi_write(spi, 0x74, operationByte, 1); //Writes the updated register value. the mode bits reset to 0 once the reading takes place
+    spi_write(spi, 0x74, operationByte, 1); //Writes the updated register value. the mode bits <1:0> reset to 0 once the reading takes place.
 
     vTaskDelay(2000 / portTICK_PERIOD_MS);  //Delay the task for x number of milliseconds. 1000mS = 1 second. Give the unit some time to actually perform the reading, there should be a bit flag we can look at later
 
@@ -205,8 +217,16 @@ void take_reading(spi_device_handle_t spi)
    /*Performs the temperature conversion calculations on the raw ADC value for floating point result, result is in Celsius*/
    double temp1 = ((tempADC / 16384.0) - (parT1 / 1024)) * parT2;
    double temp2 = (((tempADC / 131072.0) - (parT1 / 8192.0)) * ((tempADC / 131072.0) - (parT1 / 8192))) * (parT3 * 16.0);
-   double tFine = temp1 + temp2;
-   double tempComp = tFine / 5120.0;
+   double tFine = temp1 + temp2;   
+   double tempComp = tFine / 5120.0; //tempComp is the computed result of the ADC raw data, will be the returned value down the road
+   if (tempComp > TEMP_OFFSET)
+    {  
+        tempComp = tempComp - TEMP_OFFSET;
+    } 
+   else if (tempComp < TEMP_OFFSET)
+    {
+        tempComp = tempComp + TEMP_OFFSET;
+    } 
    printf("Current temperature is= %.1f", tempComp);
    printf("°C \n");
 
@@ -232,12 +252,23 @@ void take_reading(spi_device_handle_t spi)
    double pressure3 = (pressureComp / 256.0) * (pressureComp / 256.0) * (pressureComp / 256.0) * (parP10 / 131072.0);
    pressureComp = pressureComp + (pressure1 + pressure2 + pressure3 + (parP7 * 128.0)) / 16.0;
 
-   pressureComp = pressureComp * 0.000295;
-   printf("Current pressure is= %.1f", pressureComp);
+   pressureComp = pressureComp * 0.000295; //The value is in Pascal, convert it to inHg.
+
+   /*Offset calculation for the pressure*/
+   if (pressureComp > PRESSURE_OFFSET)
+    {
+        pressureComp = pressureComp - PRESSURE_OFFSET;
+    } 
+   else if (pressureComp < PRESSURE_OFFSET)
+    {
+        pressureComp = pressureComp + PRESSURE_OFFSET;
+    }
+
+   printf("Current pressure is= %.2f", pressureComp);
    printf("inHg \n");
 
    /*Humidity reading*/
-   double humidityADC = spi_read(spi, 0x26, 1) << 8 | spi_read(spi, 0x26, 1); //This gets the raw humidity ADC value
+   double humidityADC = spi_read(spi, 0x25, 1) << 8 | spi_read(spi, 0x26, 1); //This gets the raw humidity ADC value
 
    /*Performs the humidity conversion calculation on the raw ADC value for the floating point result.*/
    double humidity1 = humidityADC - ((parH1 * 16.0) + ((parH3 / 2.0) * tempComp));
@@ -249,7 +280,7 @@ void take_reading(spi_device_handle_t spi)
    printf("Current humidity is= %.1f", humidityComp);
    printf("%% \n");
 
-   /*Gas resistance reading*/
+   /*Gas sensor reading*/
    uint8_t tempData = spi_read(spi, 0x2D, 1);
    uint32_t gasRange = (tempData & 0x0F);
    int32_t gasADC = spi_read(spi, 0x2C, 1) << 2 | (tempData & 0xC0) >> 1;
